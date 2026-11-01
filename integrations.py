@@ -1,7 +1,7 @@
 """Telegram transport. Authorization is interactive CLI; sending is only called by confirmed API."""
 import asyncio, hashlib, json, os, re, secrets, threading
 from datetime import datetime, timezone, timedelta
-from core import DATA, db, job, now, update_job, month_cutoff, settings
+from core import DATA, db, job, now, update_job, month_cutoff, settings, collection_cutoff
 TG_LOCK=threading.Lock()
 
 def config():
@@ -30,30 +30,66 @@ def username(value):
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{3,31}',value): raise ValueError('Укажите публичный username Telegram: @recruiter или https://t.me/recruiter')
     return value
 
+def channel_url(value):
+    """Source links may refer to a public channel or an existing private membership."""
+    match=re.fullmatch(r'https?://t\.me/c/([1-9][0-9]{0,15})/?',value.strip())
+    return 'https://t.me/c/'+match[1] if match else 'https://t.me/'+username(value)
+
+def channel_target(value):
+    url=channel_url(value)
+    if '/c/' in url:
+        from telethon.tl.types import PeerChannel
+        from telethon.utils import get_peer_id
+        return get_peer_id(PeerChannel(int(url.rsplit('/',1)[-1])))
+    return username(url)
+
+def telegram_message_text(msg):
+    links=[e.url for e in (getattr(msg,'entities',None) or []) if getattr(e,'url',None)]
+    for row in (getattr(msg,'buttons',None) or []):
+        links.extend(button.url for button in row if getattr(button,'url',None))
+    return (msg.message or '')+('\n'+'\n'.join(dict.fromkeys(links)) if links else '')
+
 def telegram_collect(url):
-    name=username(url)
+    name=channel_target(url);base=channel_url(url)
     async def work(client):
         out=[]
         async for msg in client.iter_messages(name,limit=2000):
-            if msg.date and msg.date<month_cutoff(): break
-            text=msg.message or ''
+            if msg.date and msg.date<collection_cutoff(): break
+            text=telegram_message_text(msg)
             if not text.strip(): continue
             lines=[x.strip() for x in text.splitlines() if x.strip()]
-            out.append({'published_at':msg.date.isoformat() if msg.date else '', 'title':next((line for line in lines[:10] if re.search(r'(?<!\w)qa(?!\w)|тестировщик',line,re.I)),lines[0])[:300], 'description':text,'url':f'https://t.me/{name}/{msg.id}'})
+            out.append({'published_at':msg.date.isoformat() if msg.date else '', 'title':next((line for line in lines[:10] if re.search(r'(?<!\w)qa(?!\w)|тестировщик',line,re.I)),lines[0])[:300], 'description':text,'url':f'{base}/{msg.id}'})
         return out
     return telegram_run(work)
 
+class TelegramPosts(list):
+    pass
+
 def telegram_search_company(company,channels):
+    from contact_search import company_search_term, company_matches
+    query=company_search_term(company)
     async def work(client):
-        posts=[];errors=[]
+        posts=[];errors=[];checked=attempted=0;deadline=asyncio.get_running_loop().time()+80
+        async def search_channel(channel):
+            name=channel_target(channel['url']);base=channel_url(channel['url'])
+            async for msg in client.iter_messages(name,search=query,limit=10):
+                text=telegram_message_text(msg)
+                if text and company_matches(company,text):posts.append({'text':text,'url':f'{base}/{msg.id}','date':msg.date.isoformat() if msg.date else ''})
         for channel in channels:
+            remaining=deadline-asyncio.get_running_loop().time()
+            if remaining<=0:
+                errors.append({'channel':channel['name'],'message':'Лимит времени поиска: часть каналов не проверена. Уже найденные посты сохранены.'});break
             try:
-                name=username(channel['url'])
-                async for msg in client.iter_messages(name,search=company,limit=10):
-                    if msg.message: posts.append({'text':msg.message,'url':f'https://t.me/{name}/{msg.id}','date':msg.date.isoformat() if msg.date else ''})
-            except Exception as e:errors.append({'channel':channel['name'],'message':str(e)[:250]})
+                attempted+=1
+                await asyncio.wait_for(search_channel(channel),timeout=min(10,remaining))
+                checked+=1
+            except Exception as e:
+                errors.append({'channel':channel['name'],'message':'Тайм-аут канала' if isinstance(e,asyncio.TimeoutError) else str(e)[:250]})
+                if type(e).__name__=='FloodWaitError':break
         posts.sort(key=lambda x:x['date'],reverse=True)
-        return posts[:10],errors
+        unique={post['url']:post for post in posts}
+        result=TelegramPosts(unique.values());result.channels_checked=checked;result.channels_attempted=attempted
+        return result,errors
     return telegram_run(work)
 
 def digest(j):

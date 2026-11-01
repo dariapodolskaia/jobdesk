@@ -1,5 +1,5 @@
 """JobDesk: local data, filtering, ingestion. No AI or outbound messages here."""
-import calendar, email.utils, ssl, time, difflib
+import calendar, email.utils, ssl, time, difflib, contextvars
 import contextlib, datetime as dt, hashlib, ipaddress, json, os, re, socket, sqlite3, threading, urllib.parse, urllib.request, urllib.robotparser
 from html.parser import HTMLParser
 from pathlib import Path
@@ -7,7 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('JOBDESK_DATA', ROOT / 'data')).resolve()
 STAGES = {'draft':'Черновики','ready':'Готово','sent':'Отправлено','reply':'Ответ','interview':'Интервью','test':'Тестовое','offer':'Оффер','rejected':'Отказ','archive':'Архив'}
-DEFAULTS = {'include':['manual qa','тестировщик','ручной тестировщик','qa','qa middle'], 'exclude':['aqa','automation','python','java'], 'remote_only':True,'exclude_rf_only':True,'russian_only':True,'agent_enabled':False,'auto_contacts':True,'hh_email':'','last_run':None}
+DEFAULTS = {'include':['manual qa','тестировщик','ручной тестировщик','qa','qa middle'], 'exclude':['aqa','automation','python','java'], 'remote_only':True,'exclude_rf_only':True,'russian_only':True,'agent_enabled':False,'auto_contacts':True,'hh_email':'','last_run':None,'collection_period':'month'}
+COLLECTION_PERIODS={'day':'1 день','week':'1 неделя','two_weeks':'2 недели','three_weeks':'3 недели','month':'Месяц'}
+COLLECTION_WINDOW=contextvars.ContextVar('collection_window',default=None)
 SOURCES = [
  ('HeadHunter','hh','https://hh.ru/',''),
  ('Talent Move','html','https://talent-move.ru/job-category/qa/',r'/jobs?/|/vacanc'),
@@ -71,6 +73,7 @@ def set_settings(s):
         old[k]=[x.strip() for x in old[k] if x.strip()]
     for k in ('remote_only','exclude_rf_only','russian_only','agent_enabled','auto_contacts'): old[k]=bool(old[k])
     old['hh_email']=str(old.get('hh_email','')).strip()[:200]
+    validate_collection_period(old['collection_period'])
     if old['hh_email'] and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',old['hh_email']): raise ValueError('Некорректный email для HH')
     with db() as c: c.execute('UPDATE settings SET body=? WHERE id=1',(json.dumps(old),))
     return old
@@ -93,8 +96,9 @@ def classify(title,description,s=None):
     rf=bool(re.search(r'(?:только|исключительно)\s+(?:из\s+|в\s+|по\s+)?(?:рф|росси[ия])\b|удал[её]н\w*\s+(?:по\s+|из\s+)?(?:рф|росси[ия])\b|(?:нахождени[ея]|проживани[ея]|территории)\s+(?:на\s+|в\s+)?(?:рф|россии)\b',text))
     global_ok=bool(re.search(r'из любой (?:страны|точки)|по всему миру|worldwide|работ\w* из грузии|грузия|global remote',text))
     remote=bool(re.search(r'удал[её]н|remote',text))
-    hybrid=bool(re.search(r'гибрид|hybrid',text))
-    office=bool(re.search(r'только\s+(?:из\s+)?офис|работа\s+в\s+офисе',text))
+    hybrid=bool(re.search(r'(?<!\w)(?:гибрид\w*|hybrid)(?!\w)',text))
+    format_text=re.sub(r'\b(?:microsoft\s+office|ms\s+office|office\s*365)\b','',text)
+    office=bool(re.search(r'(?<!\w)(?:офис\w*|office|on[\s_-]?site)(?!\w)',format_text))
     if s['remote_only']:
         if hybrid or office: reasons.append('Гибридный или офисный формат'); rejected=True
         elif not remote: reasons.append('Удалённый формат не подтверждён'); uncertain=True
@@ -120,6 +124,24 @@ def month_cutoff(reference=None):
     year,month=(reference.year-1,12) if reference.month==1 else (reference.year,reference.month-1)
     return reference.replace(year=year,month=month,day=min(reference.day,calendar.monthrange(year,month)[1]),hour=0,minute=0,second=0,microsecond=0)
 
+def validate_collection_period(period):
+    if not isinstance(period,str) or period not in COLLECTION_PERIODS:raise ValueError('Выберите период: 1 день, 1, 2, 3 недели или месяц')
+    return period
+
+def collection_reference():
+    window=COLLECTION_WINDOW.get()
+    return window[0] if window else dt.datetime.now().astimezone()
+
+def collection_cutoff(reference=None,period=None):
+    window=COLLECTION_WINDOW.get()
+    if window and reference is None and period is None:return window[1]
+    reference=reference or dt.datetime.now().astimezone()
+    period=validate_collection_period(period if period is not None else settings()['collection_period'])
+    return month_cutoff(reference) if period=='month' else reference-dt.timedelta(days={'day':1,'week':7,'two_weeks':14,'three_weeks':21}[period])
+
+def collection_publication_status(value):
+    return publication_status(value,collection_reference(),cutoff=collection_cutoff())
+
 def parse_date(value):
     if not value: return None
     if isinstance(value,dt.datetime): result=value
@@ -131,11 +153,11 @@ def parse_date(value):
     if result.tzinfo is None: result=result.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
     return result
 
-def publication_status(value,reference=None):
+def publication_status(value,reference=None,cutoff=None):
     reference=reference or dt.datetime.now().astimezone(); published=parse_date(value)
     if published is None: return 'unknown'
     if published>reference+dt.timedelta(minutes=5): return 'future'
-    return 'recent' if published>=month_cutoff(reference) else 'old'
+    return 'recent' if published>=(cutoff if cutoff is not None else month_cutoff(reference)) else 'old'
 
 def with_publication(state,published_at):
     status=publication_status(published_at)
@@ -163,8 +185,20 @@ def diagnose_hh():
         return {'ok':True,'found':d.get('found',0),'milliseconds':round((time.monotonic()-started)*1000),'message':'HH API доступен. Поиск ограничен последним календарным месяцем.'}
     except Exception as e: return {'ok':False,'message':str(e),'milliseconds':round((time.monotonic()-started)*1000)}
 
+def infer_job_title(text):
+    lines=[re.sub(r'^[\s#*•—–-]+|[\s*]+$','',line).strip() for line in str(text or '').splitlines() if line.strip()]
+    for line in lines[:12]:
+        label=re.match(r'^(?:название вакансии|должность|вакансия|позиция|job title|position)\s*[:：–—-]\s*(.+)',line,re.I)
+        if label and len(label[1])<=300:return label[1].strip()
+    for line in lines[:6]:
+        if len(line)>150 or re.match(r'^(?:компания|требования|обязанности|опыт|навыки|ищем|мы ищем)\b',line,re.I):continue
+        if re.search(r'(?<!\w)(?:qa|tester|engineer|developer|analyst|designer|manager|тестировщик\w*|разработчик\w*|аналитик\w*|дизайнер\w*|менеджер\w*)(?!\w)',line,re.I):
+            return re.sub(r'^(?:вакансия|должность|позиция)\s+','',line,flags=re.I).strip()
+    return ''
+
 def add_job(v):
-    title=str(v.get('title','')).strip()[:300]; description=str(v.get('description','')).strip()[:100000]
+    description=str(v.get('description','')).strip()[:100000]
+    title=(str(v.get('title','')).strip() or infer_job_title(description))[:300]
     if not title: raise ValueError('Укажите название вакансии')
     company=str(v.get('company','')).strip()[:300]; url=canonical_url(str(v.get('url','')).strip())
     fingerprint=hashlib.sha256((url or (title.casefold()+'|'+company.casefold()+'|'+description)).encode()).hexdigest()
@@ -387,10 +421,10 @@ def collect(source):
         s=settings(); terms=s['include'] or ['qa']; seen=set()
         for term in terms:
             for page in range(2):
-                query=urllib.parse.urlencode({'text':term,'search_field':'name','per_page':30,'page':page,'order_by':'publication_time','date_from':month_cutoff().isoformat(timespec='seconds'),'date_to':dt.datetime.now().astimezone().isoformat(timespec='seconds')})
+                query=urllib.parse.urlencode({'text':term,'search_field':'name','per_page':30,'page':page,'order_by':'publication_time','date_from':collection_cutoff().isoformat(timespec='seconds'),'date_to':collection_reference().isoformat(timespec='seconds')})
                 d=hh_get('vacancies?'+query)
                 for j in d.get('items',[]):
-                    if publication_status(j.get('published_at'))!='recent':continue
+                    if collection_publication_status(j.get('published_at'))!='recent':continue
                     if j['id'] in seen: continue
                     seen.add(j['id'])
                     if any(matches(j['name'],term) for term in s['exclude']): continue
@@ -431,9 +465,13 @@ def collect(source):
         return collect_html(source)
     raise ValueError('Неизвестный тип источника')
 
-def sync(source_id=None):
+def sync(source_id=None,period=None):
+    period=validate_collection_period(period if period is not None else settings()['collection_period'])
     if not SYNC_LOCK.acquire(blocking=False): raise ValueError('Сбор уже выполняется')
+    reference=dt.datetime.now().astimezone()
+    window_token=COLLECTION_WINDOW.set((reference,collection_cutoff(reference,period)))
     try:
+        set_settings({'collection_period':period})
         with db() as c:
             sources=[dict(r) for r in c.execute('SELECT * FROM sources WHERE id=?',(source_id,))] if source_id else [dict(r) for r in c.execute('SELECT * FROM sources WHERE enabled=1')]
         results=[]
@@ -444,7 +482,7 @@ def sync(source_id=None):
                 for item in items:
                     try:
                         if not isinstance(item,dict) or not str(item.get('title','')).strip():raise ValueError('Источник передал карточку без названия')
-                        pub=publication_status(item.get('published_at'))
+                        pub=collection_publication_status(item.get('published_at'))
                         if pub=='old': old+=1;continue
                         if pub=='unknown': undated+=1;continue
                         if pub=='future': future+=1;continue
@@ -454,7 +492,7 @@ def sync(source_id=None):
                         if result['duplicate']: duplicates+=1
                         else: new+=1
                     except Exception as e:item_errors.append(str(e)[:200])
-                message=f'Найдено {len(items)}; добавлено {new}; дубли {duplicates}; старые {old}; без даты {undated}; будущие {future}; исключены фильтрами {excluded}. Только публикации с {month_cutoff().date()}.'
+                message=f'Найдено {len(items)}; добавлено {new}; дубли {duplicates}; вне периода {old}; без даты {undated}; будущие {future}; исключены фильтрами {excluded}. Период: {COLLECTION_PERIODS[period]}, с {collection_cutoff().isoformat(timespec="seconds")}.'
                 warnings=list(getattr(items,'warnings',[]))
                 if item_errors:warnings.append(f'Карточки с ошибками: {len(item_errors)}. '+item_errors[0])
                 if warnings:message+=' Неполный сбор: '+'; '.join(warnings)
@@ -468,11 +506,13 @@ def sync(source_id=None):
             with db() as c:
                 pending=[dict(r) for r in c.execute("SELECT * FROM jobs WHERE contact_status='not_searched'")]
             for candidate in pending:
-                if decorate_job(candidate)['filter_state']=='excluded' or publication_status(candidate['published_at'])!='recent':continue
+                if decorate_job(candidate)['filter_state']=='excluded' or collection_publication_status(candidate['published_at'])!='recent':continue
                 try:search_contacts(candidate['id'])
                 except Exception:
                     store(candidate['id'],{'status':'error','candidates':[],'log':[{'step':'internal','ok':False,'message':'Поиск контакта не завершён. Повторите поиск в карточке.'}]})
         with db() as c:
             s=settings(); s['last_run']=now(); c.execute('UPDATE settings SET body=? WHERE id=1',(json.dumps(s),))
         return results
-    finally: SYNC_LOCK.release()
+    finally:
+        COLLECTION_WINDOW.reset(window_token)
+        SYNC_LOCK.release()

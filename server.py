@@ -29,12 +29,13 @@ def start_contact_search(jid):
     return {'started':True}
 
 
-def start_sync(source_id=None):
+def start_sync(source_id=None,period=None):
+    period=core.validate_collection_period(period if period is not None else core.settings()['collection_period'])
     with RUN_LOCK:
         if RUN['running']: raise ValueError('Сбор уже выполняется')
-        RUN.update(running=True,error='',results=[])
+        RUN.update(running=True,error='',results=[],period=period)
     def worker():
-        try: RUN['results']=core.sync(source_id)
+        try: RUN['results']=core.sync(source_id,period)
         except Exception as e: RUN['error']=str(e)
         finally: RUN['running']=False
     threading.Thread(target=worker,daemon=True).start()
@@ -79,7 +80,7 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/state':
                 from integrations import connected
                 with db() as c:
-                    jobs=[core.decorate_job(dict(r)) for r in c.execute('SELECT * FROM jobs ORDER BY id DESC')]
+                    jobs=[core.decorate_job(dict(r)) for r in c.execute('SELECT * FROM jobs ORDER BY datetime(published_at) DESC,id DESC')]
                     sources=[dict(r) for r in c.execute('SELECT * FROM sources ORDER BY id')]
                     profile=dict(c.execute('SELECT * FROM profile WHERE id=1').fetchone())
                     events=[dict(r) for r in c.execute('SELECT e.*,j.company FROM events e LEFT JOIN jobs j ON e.job_id=j.id ORDER BY start')]
@@ -100,7 +101,7 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/export.csv':
                 out=io.StringIO(); w=csv.writer(out); fields=['id','title','company','url','stage','salary','contact','created','notes']; w.writerow(fields)
                 with db() as c:
-                    for r in c.execute('SELECT * FROM jobs ORDER BY id DESC'):
+                    for r in c.execute('SELECT * FROM jobs ORDER BY datetime(published_at) DESC,id DESC'):
                         values=[r[k] for k in fields]
                         w.writerow(["'"+str(x) if str(x).startswith(('=','+','-','@','\t','\r')) else x for x in values])
                 self.respond(('\ufeff'+out.getvalue()).encode(),ctype='text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="applications.csv"'}); return
@@ -117,6 +118,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith('/api/jobs/'):
                 result=core.update_job(int(path.rsplit('/',1)[1]),b)
             elif path=='/api/import-url': result=core.import_url(str(b.get('url','')))
+            elif path=='/api/parse-vacancy':result={'title':core.infer_job_title(str(b.get('description',''))[:100000])}
             elif path=='/api/settings': result=core.set_settings(b)
             elif path=='/api/reclassify':
                 with db() as c: rows=[dict(r) for r in c.execute('SELECT * FROM jobs')]
@@ -143,8 +145,8 @@ class Handler(BaseHTTPRequestHandler):
                 if kind not in ('hh','rss','html','browser','telegram','manual'): raise ValueError('Неизвестный тип источника')
                 if not name: raise ValueError('Название обязательно')
                 if kind=='telegram':
-                    from integrations import username
-                    url='https://t.me/'+username(url)
+                    from integrations import channel_url
+                    url=channel_url(url)
                 else: url=core.canonical_url(url)
                 if not url: raise ValueError('Укажите ссылку')
                 if kind=='html' and pattern:
@@ -170,7 +172,7 @@ class Handler(BaseHTTPRequestHandler):
                 jid=int(b['job_id']);j=core.job(jid);items=json.loads(j['contact_candidates']);index=int(b['index'])
                 if index<0 or index>=len(items):raise ValueError('Контакт не найден')
                 result=core.update_job(jid,{'contact':items[index]['value'],'contact_source':items[index]['source']})
-            elif path=='/api/sync': result=start_sync(int(b['source_id']) if b.get('source_id') else None)
+            elif path=='/api/sync': result=start_sync(int(b['source_id']) if b.get('source_id') else None,b.get('period'))
             elif path=='/api/events':
                 title=str(b.get('title','')).strip()[:300]; start=str(b.get('start',''))
                 if not title: raise ValueError('Название обязательно')

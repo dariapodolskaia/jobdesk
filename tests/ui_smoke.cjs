@@ -29,8 +29,30 @@ process.on('exit',()=>child.kill());
  }
  q('[data-view="settings"]').click();submit('#settings-form');await wait(()=>q('#toast').textContent==='Настройки сохранены');q('[data-view="board"]').click();assert.strictEqual(w.document.querySelectorAll('.card').length,1);assert(!q('.board').textContent.includes('QA с лета'));assert(!q('.board').textContent.includes('QA без даты'));
  q('#job-filter').value='all';q('#job-filter').dispatchEvent(new w.Event('change'));assert.strictEqual(w.document.querySelectorAll('.card').length,3);
+ for(const [title,days] of [['QA вчера',1],['QA позавчера',2]]){
+  const response=await w.fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json','X-JobDesk-Token':state.token},body:JSON.stringify({title,company:'Проверка сортировки',description:'Удалённая работа из любой страны. Тестирование API и веб-приложений.',published_at:new Date(Date.now()-days*86400000).toISOString()})});const created=await response.json();assert(response.ok);
+  const update=await w.fetch('/api/jobs/'+created.id,{method:'POST',headers:{'Content-Type':'application/json','X-JobDesk-Token':state.token},body:JSON.stringify({stage:'interview'})});assert(update.ok);
+ }
+ q('[data-view="profile"]').click();submit('#profile-form');await wait(()=>q('#toast').textContent==='Профиль сохранён');q('[data-view="board"]').click();
+ assert.deepStrictEqual(Array.from(w.document.querySelectorAll('[data-stage="interview"] .card h3'),e=>e.textContent),['Manual QA','QA вчера','QA позавчера']);
+ q('[data-view="table"]').click();assert.deepStrictEqual(Array.from(w.document.querySelectorAll('tbody tr td:first-child b'),e=>e.textContent),['Manual QA','QA вчера','QA позавчера','QA с лета','QA без даты']);
+ assert.deepStrictEqual(Array.from(q('#collection-period').options,o=>o.value),['day','week','two_weeks','three_weeks','month']);
+ q('#collection-period').value='week';q('#collection-period').dispatchEvent(new w.Event('change'));await wait(()=>q('#toast').textContent==='Период сбора сохранён');
+ const afterPeriod=await (await w.fetch('/api/state')).json();assert.strictEqual(afterPeriod.settings.collection_period,'week');assert.strictEqual(afterPeriod.jobs[0].title,'Manual QA');assert.strictEqual(afterPeriod.jobs.at(-1).title,'QA без даты');
  q('[data-view="settings"]').click();assert(q('#hh-token'));q('#hh-token').value='test-private-token';submit('#hh-token-form');await wait(()=>q('#toast').textContent==='Токен HH сохранён');
  const exported=await (await w.fetch('/api/export')).text();assert(!exported.includes('test-private-token'));
+ q('#add').click();q('#description').value='Middle QA Engineer\nКомпания: Plat4m.Tech\nУдалённая работа';q('#description').dispatchEvent(new w.Event('input'));await wait(()=>q('#title').value==='Middle QA Engineer');
+ q('#title').value='Моя должность';q('#title').dispatchEvent(new w.Event('input'));q('#description').value='Senior QA Engineer\nНовое описание';q('#description').dispatchEvent(new w.Event('input'));await new Promise(r=>setTimeout(r,350));assert.strictEqual(q('#title').value,'Моя должность');q('#close-dialog').click();
+ q('[data-view="table"]').click();q('tbody tr').click();await wait(()=>q('#edit-job'));
+ const realFetch=w.fetch;let contactPending=true;
+ w.fetch=async(url,options)=>{
+  if(url==='/api/contacts/search')return new Response(JSON.stringify({started:true}));
+  const response=await realFetch(url,options);
+  if(url==='/api/state'){const body=await response.json();body.contact_running=contactPending?[1]:[];contactPending=false;return new Response(JSON.stringify(body))}
+  if(url==='/api/jobs/1'){const body=await response.json();body.contact_status='found';body.contact_candidates=JSON.stringify([{value:'@hr_plat4mtech',kind:'telegram',source:'https://t.me/qa_jobs/42',method:'telegram',context:'HR компании'}]);return new Response(JSON.stringify(body))}
+  return response;
+ };
+ q('#letter').value='Несохранённый текст письма';q('#find-job-contact').click();await wait(()=>q('#contact-results').textContent.includes('@hr_plat4mtech'));assert.strictEqual(q('#letter').value,'Несохранённый текст письма');assert(!q('#find-job-contact').disabled);w.fetch=realFetch;
  assert.deepStrictEqual(errors,[]);assert(!w.document.querySelector('script[src="alert(1)"]'));
- console.log('PASS: CRUD, filters, monthly board hides old/undated jobs, history preserves them, HH token form and export privacy. No JS errors.');dom.window.close();child.kill();
+ console.log('PASS: CRUD, sorting, periods, history, token privacy, title autofill without replacing edits, contact results refresh without losing unsaved letter. No JS errors.');dom.window.close();child.kill();
 })().catch(e=>{console.error(e);child.kill();process.exitCode=1});

@@ -66,7 +66,7 @@ def collect_html(source):
             except Exception as e:failures.append(str(e))
         out.extend(page_items)
         # Stop only if every parsed date on this listing is known and older.
-        if page_items and all(core.publication_status(j.get('published_at'))=='old' for j in page_items):
+        if page_items and all(core.collection_publication_status(j.get('published_at'))=='old' for j in page_items):
             pending=[];break
     if pending or len(seen)>=MAX_CARDS:out.warnings.append(f'Достигнут лимит обхода: {MAX_PAGES} страниц / {MAX_CARDS} карточек; часть ленты не проверена.')
     if failures:out.warnings.append(f'Не прочитано страниц/карточек: {len(failures)}. '+failures[0][:180])

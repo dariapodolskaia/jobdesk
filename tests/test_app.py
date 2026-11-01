@@ -29,6 +29,15 @@ class AppTests(unittest.TestCase):
             self.assertEqual(result['filter_state'],'excluded',phrase)
         self.assertEqual(core.classify('QA','Удалённая работа. Тестируем веб-приложения и REST API.')['filter_state'],'review')
         self.assertEqual(core.classify('QA','Гибрид. Тестируем API. Работа из любой страны.')['filter_state'],'excluded')
+
+    def test_office_and_hybrid_format_always_excluded_in_remote_search(self):
+        base='Удалённая работа из любой страны. Ручное тестирование API и веб-приложений. '
+        for format in ['Формат работы: офис / гибрид','Офисный формат','Можно удалённо или в офисе','Гибридный график','office','on-site','ONSITE','ON_SITE','hybrid']:
+            with self.subTest(format=format):
+                result=core.classify('Manual QA',base+format)
+                self.assertEqual(result['filter_state'],'excluded')
+                self.assertIn('Гибридный или офисный формат',result['reasons'])
+        self.assertEqual(core.classify('Manual QA',base+'Умение пользоваться Microsoft Office, MS Office и Office 365.')['filter_state'],'match')
     def test_dedup_and_persistence(self):
         jid=self.add(url='https://example.com/job/1?utm_source=test')
         r=core.add_job({'title':'Другое название','url':'https://example.com/job/1','description':'Другое описание'})
