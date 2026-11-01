@@ -55,6 +55,9 @@ def collect_browser(source):
             # A few ordinary scrolls allow lazy-loaded lists; this is a bounded scan, not full crawling.
             for _ in range(3):page.evaluate('window.scrollBy(0, window.innerHeight)');page.wait_for_timeout(700)
             html=page.content()
+            body=page.locator('body').inner_text()
+            if re.search(r'Что-то пошло не так\s*Попробуйте ещё раз',body,re.I):
+                raise ValueError('Источник сам показывает «Что-то пошло не так». Страница вакансий не загрузилась; это ошибка сайта, а не отсутствие вакансий.')
             if re.search(r'captcha|проверка, что вы не робот|verify you are human|just a moment',page.title(),re.I):raise ValueError('Сайт требует проверку/капчу. Автообход отсутствует; используйте ручной импорт.')
             parsed=Page();parsed.feed(html);out=[]
             for script in parsed.scripts:
@@ -62,6 +65,8 @@ def collect_browser(source):
                     for j in posting_objects(json.loads(script)):out.append(from_posting(j,url))
                 except (ValueError,TypeError):pass
             for payload in payloads:out.extend(objects_from_payload(payload,url))
+            if not out and 'find.dreamoffer.app' in url and 'дополнительной защитой от автоматических запросов' in body:
+                raise ValueError('Dream Offer не загрузил вакансии: сайт работает в ограниченном режиме и запрашивает согласия / подтверждение действия. Проверьте доступ вручную; другие источники продолжают работать.')
             pattern=source.get('pattern') or r'/(?:vacanc(?:y|ies)|jobs?)/[^/?]+|/[^/?]+/[^/?]*-\d+(?:[/?]|$)'
             rx=re.compile(pattern);links=[]
             for href,label in parsed.links:
@@ -78,7 +83,10 @@ def collect_browser(source):
                         except (ValueError,TypeError):pass
                     if not found:out.append(core.page_posting(detail,candidate))
                 except Exception:continue
-            if not out:raise ValueError('Страница отрисована, но карточки не распознаны. Нужен адаптер структуры этого сайта; это не результат «0 вакансий». Пришлите текст этой ошибки и адрес источника.')
+            if not out:
+                if 'find.dreamoffer.app' in url and 'дополнительной защитой от автоматических запросов' in body:
+                    raise ValueError('Dream Offer не загрузил вакансии: сайт работает в ограниченном режиме и запрашивает согласия / подтверждение действия. Проверьте доступ вручную; другие источники продолжают работать.')
+                raise ValueError('Страница отрисована, но карточки не распознаны. Нужен адаптер структуры этого сайта; это не результат «0 вакансий». Пришлите текст этой ошибки и адрес источника.')
             return out
         finally:
             if browser:browser.close()

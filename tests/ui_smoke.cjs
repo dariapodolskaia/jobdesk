@@ -23,6 +23,14 @@ process.on('exit',()=>child.kill());
  q('[data-view="settings"]').click();assert(q('#include').value.includes('manual qa'));assert(q('#diagnose-hh'));assert(q('#serper-key'));q('#hh_email').value='qa@example.com';q('#exclude').value+='\nruby';submit('#settings-form');await wait(()=>q('#toast').textContent==='Настройки сохранены');
  q('[data-view="profile"]').click();q('#body').value='Проверенный опыт QA';submit('#profile-form');await wait(()=>q('#toast').textContent==='Профиль сохранён');
  q('[data-view="board"]').click();assert(q('.card').textContent.includes('Manual QA'));
+ const state=await (await w.fetch('/api/state')).json();
+ for(const [title,published_at] of [['QA с лета','2026-06-01'],['QA без даты','']]){
+  const response=await w.fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json','X-JobDesk-Token':state.token},body:JSON.stringify({title,company:'Проверка даты',description:'Удалённая работа из любой страны. Тестирование API и веб-приложений.',published_at})});assert(response.ok);
+ }
+ q('[data-view="settings"]').click();submit('#settings-form');await wait(()=>q('#toast').textContent==='Настройки сохранены');q('[data-view="board"]').click();assert.strictEqual(w.document.querySelectorAll('.card').length,1);assert(!q('.board').textContent.includes('QA с лета'));assert(!q('.board').textContent.includes('QA без даты'));
+ q('#job-filter').value='all';q('#job-filter').dispatchEvent(new w.Event('change'));assert.strictEqual(w.document.querySelectorAll('.card').length,3);
+ q('[data-view="settings"]').click();assert(q('#hh-token'));q('#hh-token').value='test-private-token';submit('#hh-token-form');await wait(()=>q('#toast').textContent==='Токен HH сохранён');
+ const exported=await (await w.fetch('/api/export')).text();assert(!exported.includes('test-private-token'));
  assert.deepStrictEqual(errors,[]);assert(!w.document.querySelector('script[src="alert(1)"]'));
- console.log('PASS: empty board, manual create, safe notes, letter save, stage move, table, source addition, calendar event, filters, profile. No JS errors.');dom.window.close();child.kill();
+ console.log('PASS: CRUD, filters, monthly board hides old/undated jobs, history preserves them, HH token form and export privacy. No JS errors.');dom.window.close();child.kill();
 })().catch(e=>{console.error(e);child.kill();process.exitCode=1});

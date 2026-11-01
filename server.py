@@ -92,10 +92,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond((DATA/name).read_bytes(),ctype='application/pdf',extra={'Content-Disposition':'inline; filename="cv.pdf"'}); return
             if path=='/api/search-config':
                 from contact_search import search_settings
-                self.respond({'serper_configured':bool(search_settings().get('serper_key'))});return
+                self.respond({'serper_configured':bool(search_settings().get('serper_key')),'hh_configured':bool(search_settings().get('hh_token'))});return
             if path=='/api/export':
                 with db() as c:
-                    result={table:[dict(r) for r in c.execute('SELECT * FROM '+table)] for table in ('jobs','sources','profile','settings','events','history','messages')}
+                    result={table:[dict(r) for r in c.execute('SELECT * FROM '+table)] for table in ('jobs','job_sources','sources','profile','settings','events','history','messages')}
                 self.respond(result,extra={'Content-Disposition':'attachment; filename="jobdesk-export.json"'}); return
             if path=='/api/export.csv':
                 out=io.StringIO(); w=csv.writer(out); fields=['id','title','company','url','stage','salary','contact','created','notes']; w.writerow(fields)
@@ -162,7 +162,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path=='/api/hh/diagnose':result=core.diagnose_hh()
             elif path=='/api/search-config':
                 from contact_search import save_search_key
-                save_search_key(b.get('serper_key',''));result={'saved':True}
+                for field in ('serper_key','hh_token'):
+                    if field in b:save_search_key(b[field],field)
+                result={'saved':True}
             elif path=='/api/contacts/search':result=start_contact_search(int(b['job_id']))
             elif path=='/api/contacts/select':
                 jid=int(b['job_id']);j=core.job(jid);items=json.loads(j['contact_candidates']);index=int(b['index'])

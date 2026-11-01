@@ -1,5 +1,5 @@
 """JobDesk: local data, filtering, ingestion. No AI or outbound messages here."""
-import calendar, email.utils, ssl, time
+import calendar, email.utils, ssl, time, difflib
 import contextlib, datetime as dt, hashlib, ipaddress, json, os, re, socket, sqlite3, threading, urllib.parse, urllib.request, urllib.robotparser
 from html.parser import HTMLParser
 from pathlib import Path
@@ -7,11 +7,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('JOBDESK_DATA', ROOT / 'data')).resolve()
 STAGES = {'draft':'Черновики','ready':'Готово','sent':'Отправлено','reply':'Ответ','interview':'Интервью','test':'Тестовое','offer':'Оффер','rejected':'Отказ','archive':'Архив'}
-DEFAULTS = {'include':['manual qa','тестировщик','ручной тестировщик','qa','qa middle'], 'exclude':['aqa','automation','python','java'], 'remote_only':True,'exclude_rf_only':True,'russian_only':True,'agent_enabled':False,'auto_contacts':False,'hh_email':'','last_run':None}
+DEFAULTS = {'include':['manual qa','тестировщик','ручной тестировщик','qa','qa middle'], 'exclude':['aqa','automation','python','java'], 'remote_only':True,'exclude_rf_only':True,'russian_only':True,'agent_enabled':False,'auto_contacts':True,'hh_email':'','last_run':None}
 SOURCES = [
  ('HeadHunter','hh','https://hh.ru/',''),
- ('Talent Move','html','https://talent-move.ru/?s=qa&format=fully-remote',r'/jobs?/|/vacanc'),
- ('HireHi','html','https://hirehi.ru/vacancies/manual-qa?format=удалённо&format=remote_europe&format=remote_global&search=qa',r'^https://hirehi\.ru/[^/?]+/[^/?]*-\d+(?:[/?]|$)'),
+ ('Talent Move','html','https://talent-move.ru/job-category/qa/',r'/jobs?/|/vacanc'),
+ ('HireHi','html','https://hirehi.ru/vacancies/manual-qa?format=удалённо&format=remote_europe&format=remote_global',r'^https://hirehi\.ru/[^/?]+/[^/?]*-\d+(?:[/?]|$)'),
  ('Dream Offer','browser','https://find.dreamoffer.app/',''),
  ('Jobtoo','browser','https://jobtoo.ru/feed?abroad=1&city=all&mode=from_russia%2Cglobal','')]
 
@@ -39,14 +39,22 @@ def init():
         CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE, external_id TEXT UNIQUE, direction TEXT NOT NULL, body TEXT NOT NULL, at TEXT NOT NULL);
         ''')
         cols={r[1] for r in c.execute('PRAGMA table_info(jobs)')}
-        for name,definition in {'published_at':"TEXT NOT NULL DEFAULT ''",'date_status':"TEXT NOT NULL DEFAULT 'unknown'",'contact_status':"TEXT NOT NULL DEFAULT 'not_searched'",'contact_candidates':"TEXT NOT NULL DEFAULT '[]'",'contact_log':"TEXT NOT NULL DEFAULT '[]'",'contact_searched_at':"TEXT NOT NULL DEFAULT ''"}.items():
+        for name,definition in {'published_at':"TEXT NOT NULL DEFAULT ''",'date_status':"TEXT NOT NULL DEFAULT 'unknown'",'contact_status':"TEXT NOT NULL DEFAULT 'not_searched'",'contact_candidates':"TEXT NOT NULL DEFAULT '[]'",'contact_log':"TEXT NOT NULL DEFAULT '[]'",'contact_searched_at':"TEXT NOT NULL DEFAULT ''",'application_routes':"TEXT NOT NULL DEFAULT '[]'"}.items():
             if name not in cols: c.execute(f'ALTER TABLE jobs ADD COLUMN {name} {definition}')
         c.execute('CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY)')
+        c.execute('CREATE TABLE IF NOT EXISTS job_sources (url TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, source TEXT NOT NULL, published_at TEXT NOT NULL DEFAULT \'\')')
         if not c.execute("SELECT 1 FROM migrations WHERE name='0.2'").fetchone():
             c.execute("UPDATE sources SET pattern=? WHERE kind='html' AND name='HireHi' AND url LIKE 'https://hirehi.ru/%'",(r'^https://hirehi\.ru/[^/?]+/[^/?]*-\d+(?:[/?]|$)',))
             c.execute("UPDATE sources SET kind='browser',status='Нужен браузер: bash setup_browser.command' WHERE kind='manual' AND (url LIKE 'https://jobtoo.ru/%' OR url LIKE 'https://find.dreamoffer.app/%')")
             c.execute("INSERT INTO migrations VALUES('0.2')")
         c.execute('INSERT OR IGNORE INTO settings VALUES (1,?)',(json.dumps(DEFAULTS),))
+        if not c.execute("SELECT 1 FROM migrations WHERE name='0.3-sources'").fetchone():
+            c.execute("UPDATE sources SET url=? WHERE kind='html' AND url=?",(SOURCES[1][2],'https://talent-move.ru/?s=qa&format=fully-remote'))
+            c.execute("UPDATE sources SET url=? WHERE kind='html' AND url=?",(SOURCES[2][2],'https://hirehi.ru/vacancies/manual-qa?format=удалённо&format=remote_europe&format=remote_global&search=qa'))
+            current=json.loads(c.execute('SELECT body FROM settings WHERE id=1').fetchone()[0])
+            current['auto_contacts']=True
+            c.execute('UPDATE settings SET body=? WHERE id=1',(json.dumps(current),))
+            c.execute("INSERT INTO migrations VALUES('0.3-sources')")
         seed=ROOT/'seed_profile.txt'
         c.execute('INSERT OR IGNORE INTO profile VALUES (1,?,?)',(seed.read_text() if seed.exists() else '', 'base_cv.pdf' if (DATA/'base_cv.pdf').exists() else ''))
         if not c.execute('SELECT 1 FROM sources LIMIT 1').fetchone():
@@ -77,7 +85,9 @@ def classify(title,description,s=None):
     if s['include'] and not any(matches(title,x) for x in s['include']): reasons.append('Название не соответствует поисковым фразам'); rejected=True
     bad=[x for x in s['exclude'] if matches(title,x)]
     if bad: reasons.append('Исключения в названии: '+', '.join(bad)); rejected=True
-    if s['russian_only'] and len(re.findall('[а-яё]',description.casefold()))<20:
+    language_text=re.sub(r'\b(?:описание|задачи|требования|условия)\s*:', '',description.casefold())
+    russian=len(re.findall('[а-яё]',language_text));letters=len(re.findall('[a-zа-яё]',language_text))
+    if s['russian_only'] and (russian<20 or russian/max(letters,1)<.15):
         if len(description)<100: reasons.append('Недостаточно текста для определения языка'); uncertain=True
         else: reasons.append('Описание не распознано как русскоязычное'); rejected=True
     rf=bool(re.search(r'(?:только|исключительно)\s+(?:из\s+|в\s+|по\s+)?(?:рф|росси[ия])\b|удал[её]н\w*\s+(?:по\s+|из\s+)?(?:рф|росси[ия])\b|(?:нахождени[ея]|проживани[ея]|территории)\s+(?:на\s+|в\s+)?(?:рф|россии)\b',text))
@@ -98,6 +108,8 @@ def canonical_url(url):
     p=urllib.parse.urlsplit(url.strip())
     if p.scheme not in ('http','https') or not p.hostname or p.username: raise ValueError('Нужна ссылка http/https без пароля')
     q=urllib.parse.parse_qsl(p.query,keep_blank_values=True)
+    if re.fullmatch(r'(?:[\w-]+\.)?(?:hh\.ru|hh\.kz|hh\.uz|headhunter\.ge|rabota\.by)',p.hostname) and re.fullmatch(r'/vacancy/\d+/?',p.path):
+        return 'https://hh.ru'+p.path.rstrip('/')
     return urllib.parse.urlunsplit((p.scheme,p.netloc.lower(),p.path.rstrip('/'),urllib.parse.urlencode(sorted((k,v) for k,v in q if not k.startswith('utm_') and k not in ('from','ref'))),''))
 
 def contacts(text):
@@ -138,13 +150,17 @@ def with_publication(state,published_at):
 def hh_get(path):
     contact=settings().get('hh_email','')
     if not contact: raise ValueError('HH: укажите контактный email в Настройках поиска → HeadHunter. Это заголовок API, а не доступ к почте.')
-    return json.loads(fetch('https://api.hh.ru/'+path,extra_headers={'HH-User-Agent':f'JobDesk/0.2 ({contact})','User-Agent':f'JobDesk/0.2 ({contact})'}))
+    headers={'HH-User-Agent':f'JobDesk/0.2 ({contact})','User-Agent':f'JobDesk/0.2 ({contact})'}
+    from contact_search import search_settings
+    token=search_settings().get('hh_token','')
+    if token: headers['Authorization']='Bearer '+token
+    return json.loads(fetch('https://api.hh.ru/'+path,extra_headers=headers))
 
 def diagnose_hh():
     started=time.monotonic()
     try:
         d=hh_get('vacancies?'+urllib.parse.urlencode({'text':'qa','search_field':'name','per_page':1,'date_from':month_cutoff().isoformat(timespec='seconds')}))
-        return {'ok':True,'found':d.get('found',0),'milliseconds':round((time.monotonic()-started)*1000),'message':'HH API доступен. Авторизация соискателя для этого запроса не использовалась.'}
+        return {'ok':True,'found':d.get('found',0),'milliseconds':round((time.monotonic()-started)*1000),'message':'HH API доступен. Поиск ограничен последним календарным месяцем.'}
     except Exception as e: return {'ok':False,'message':str(e),'milliseconds':round((time.monotonic()-started)*1000)}
 
 def add_job(v):
@@ -155,14 +171,31 @@ def add_job(v):
     published=parse_date(v.get('published_at')); published_at=published.isoformat() if published else ''
     state=with_publication(classify(title,description),published_at)
     with db() as c:
+        c.execute('BEGIN IMMEDIATE')
         prior=c.execute('SELECT id FROM jobs WHERE fingerprint=?',(fingerprint,)).fetchone()
+        if not prior and url: prior=c.execute('SELECT job_id FROM job_sources WHERE url=?',(url,)).fetchone()
         if not prior and company:
             prior=c.execute('SELECT id FROM jobs WHERE lower(title)=lower(?) AND lower(company)=lower(?) AND description=?',(title,company,description)).fetchone()
+        if not prior and company and url:
+            normalize=lambda x:' '.join(re.findall(r'\w+',x.casefold()))
+            for row in c.execute("SELECT id,title,company,description,published_at,url FROM jobs WHERE url<>''"):
+                if normalize(company)!=normalize(row['company']) or normalize(title)!=normalize(row['title']):continue
+                previous=parse_date(row['published_at'])
+                if not previous or not published or abs((published-previous).days)>31:continue
+                # Same role alone may describe different openings; require matching content too.
+                left,right=normalize(description),normalize(row['description'])
+                if min(len(left),len(right))>=100 and difflib.SequenceMatcher(None,left[:12000],right[:12000],autojunk=False).ratio()>=.85:
+                    prior=(row['id'],);break
         if prior:
-            if published_at: c.execute('UPDATE jobs SET published_at=?,date_status=? WHERE id=?',(published_at,state['date_status'],prior[0]))
+            previous=c.execute('SELECT published_at FROM jobs WHERE id=?',(prior[0],)).fetchone()[0]
+            if published_at and not parse_date(previous): c.execute('UPDATE jobs SET published_at=?,date_status=? WHERE id=?',(published_at,state['date_status'],prior[0]))
+            if url:c.execute('INSERT OR IGNORE INTO job_sources VALUES(?,?,?,?)',(url,prior[0],str(v.get('source','Вручную')),published_at))
             return {'id':prior[0],'duplicate':True}
         cur=c.execute('INSERT INTO jobs(title,company,url,description,source,fingerprint,salary,geo,filter_state,reasons,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(title,company,url,description,str(v.get('source','Вручную'))[:200],fingerprint,str(v.get('salary',''))[:300],state['geo'],state['filter_state'],json.dumps(state['reasons']),now(),now()))
         c.execute('UPDATE jobs SET published_at=?,date_status=? WHERE id=?',(published_at,state['date_status'],cur.lastrowid))
+        if v.get('application_routes'):
+            c.execute('UPDATE jobs SET application_routes=? WHERE id=?',(json.dumps(v['application_routes'],ensure_ascii=False),cur.lastrowid))
+        if url:c.execute('INSERT OR IGNORE INTO job_sources VALUES(?,?,?,?)',(url,cur.lastrowid,str(v.get('source','Вручную')),published_at))
         c.execute('INSERT INTO history(job_id,at,action) VALUES(?,?,?)',(cur.lastrowid,now(),'Вакансия добавлена'))
         return {'id':cur.lastrowid,'duplicate':False}
 
@@ -176,6 +209,7 @@ def job(jid):
         if not row: raise ValueError('Карточка не найдена')
         result=dict(row)
         for table in ('history','events','messages'): result[table]=[dict(r) for r in c.execute(f'SELECT * FROM {table} WHERE job_id=? ORDER BY id DESC',(jid,))]
+        result['sources']=[dict(r) for r in c.execute('SELECT url,source,published_at FROM job_sources WHERE job_id=?',(jid,))]
     result=decorate_job(result)
     result['extracted_contacts']=contacts(result['description']); return result
 
@@ -212,7 +246,7 @@ class Page(HTMLParser):
             if tag=='script' and a.get('type')=='application/ld+json': self.in_json=True; self.buf=[]
         if tag=='a': self.href=a.get('href'); self.label=[]
         if tag=='title': self.in_title=True
-        if tag=='h1': self.in_h1=True
+        if tag=='h1' and not self.h1: self.in_h1=True
         if tag in ('p','div','br','li','h1','h2','section'): self.text.append('\n')
     def handle_endtag(self,tag):
         if tag=='script' and self.in_json:
@@ -264,7 +298,7 @@ def fetch(url,limit=4_000_000,extra_headers=None):
                 try:
                     payload=json.loads(raw); detail=json.dumps(payload.get('errors',payload.get('description','')),ensure_ascii=False)[:450]; rid=payload.get('request_id','')
                 except ValueError: detail='Ответ не JSON';rid=''
-                helptext={400:'Проверьте параметры и контактный email.',401:'API требует авторизацию для запроса: проверьте ответ HH.',403:'Доступ запрещён HH; проверьте ограничения IP/капчу и request_id.',429:'Превышен лимит. Подождите и повторите диагностику.'}.get(e.code,'Повторите позже.')
+                helptext={400:'Проверьте параметры и контактный email.',401:'Проверьте OAuth-токен HH в настройках.',403:'HH отклонил запрос. Email не даёт права доступа: добавьте действующий OAuth-токен HH в настройках; при captcha_required нужна проверка на стороне HH. Другие источники продолжают работать.',429:'Превышен лимит. Подождите и повторите диагностику.'}.get(e.code,'Повторите позже.')
                 raise ValueError(f'HH HTTP {e.code}: {detail}. {helptext} request_id={rid}') from None
             raise ValueError(f'Источник вернул HTTP {e.code}. Доступ ограничен или страница недоступна.') from None
         except urllib.error.URLError as e:
@@ -284,7 +318,9 @@ def posting_objects(value):
 def from_posting(j,url):
     org=j.get('hiringOrganization') or {}; org=org if isinstance(org,dict) else {}
     sal=j.get('baseSalary') or {}; sal=sal if isinstance(sal,dict) else {}
-    return {'published_at':j.get('datePosted',''),'title':j.get('title') or '', 'company':org.get('name',''),'description':plain(j.get('description',''))+'\n'+str(j.get('jobLocationType',''))+'\n'+json.dumps(j.get('applicantLocationRequirements',''),ensure_ascii=False),'url':j.get('url') or url, 'salary':json.dumps(sal,ensure_ascii=False) if sal else ''}
+    work_type=str(j.get('jobLocationType',''))
+    if work_type=='TELECOMMUTE':work_type='Удалённо'
+    return {'published_at':j.get('datePosted',''),'title':j.get('title') or '', 'company':org.get('name',''),'description':plain(j.get('description',''))+'\n'+work_type+'\n'+json.dumps(j.get('applicantLocationRequirements',''),ensure_ascii=False),'url':j.get('url') or url, 'salary':json.dumps(sal,ensure_ascii=False) if sal else ''}
 
 def import_url(url):
     url=canonical_url(url)
@@ -292,10 +328,21 @@ def import_url(url):
     vid=re.search(r'/vacancy/(\d+)',urllib.parse.urlsplit(url).path)
     if hh and vid:
         d=hh_get('vacancies/'+vid[1]); return {'published_at':d.get('published_at',''),'title':d['name'],'company':(d.get('employer') or {}).get('name',''),'description':plain(d.get('description','')),'url':url,'salary':json.dumps(d.get('salary'),ensure_ascii=False) if d.get('salary') else ''}
-    page=Page(); page.feed(fetch(url))
+    raw=fetch(url);page=Page(); page.feed(raw)
     for script in page.scripts:
         try:
-            for item in posting_objects(json.loads(script)): return from_posting(item,url)
+            for item in posting_objects(json.loads(script)):
+                result=from_posting(item,url)
+                from contact_search import application_routes
+                result['application_routes']=application_routes(page,url)
+                if urllib.parse.urlsplit(url).hostname=='talent-move.ru':
+                    # JSON-LD contains only a marketing summary; use the actual vacancy body.
+                    match=re.search(r'<h1\b[^>]*>.*?</header>(.*?)(?:<div\b[^>]*class="job-quality|</article>)',raw,re.S|re.I)
+                    if match:
+                        header=re.search(r'<h1\b.*?</header>',raw,re.S|re.I)
+                        result['description']=plain(header[0]+'\n'+match[1])
+                        result['title']=page.h1.strip()
+                return result
         except (ValueError,TypeError): pass
     return page_posting(page,url)
 
@@ -380,30 +427,8 @@ def collect(source):
             out.append({'published_at':text('pubDate') or text('published'),'title':text('title'),'description':plain(text('description') or text('content') or text('summary')),'url':urllib.parse.urljoin(url,link) if link else ''})
         return out[:200]
     if kind=='html':
-        pattern=source['pattern']
-        if len(pattern)>300: raise ValueError('Слишком длинный шаблон ссылок')
-        try: rx=re.compile(pattern or r'/vacanc|/jobs?/')
-        except re.error: raise ValueError('Некорректный шаблон ссылок')
-        # Honour robots for the HTML connector; do not bypass challenges.
-        parts=urllib.parse.urlsplit(url); robot=robots_for(url)
-        if not robot.can_fetch('JobDeskLocal',url): raise ValueError('robots.txt запрещает автоматическое чтение этой страницы')
-        p=Page(); p.feed(fetch(url))
-        for script in p.scripts:
-            try:
-                for item in posting_objects(json.loads(script)): out.append(from_posting(item,url))
-            except (ValueError,TypeError): pass
-        urls=[]
-        for href,label in p.links:
-            candidate=urllib.parse.urljoin(url,href)
-            if urllib.parse.urlsplit(candidate).netloc!=parts.netloc or not rx.search(candidate): continue
-            if candidate not in urls and candidate!=url: urls.append(candidate)
-        failures=[]
-        for candidate in urls[:25]:
-            if robot.can_fetch('JobDeskLocal',candidate):
-                try: out.append(import_url(candidate))
-                except Exception as e: failures.append(str(e)[:200]); continue
-        if not out: raise ValueError('Карточки не прочитаны: '+('; '.join(failures[:2]) if failures else 'Ссылок по шаблону нет. Проверьте шаблон или выберите тип Браузер (JavaScript).'))
-        return out
+        from source_readers import collect_html
+        return collect_html(source)
     raise ValueError('Неизвестный тип источника')
 
 def sync(source_id=None):
@@ -413,25 +438,40 @@ def sync(source_id=None):
             sources=[dict(r) for r in c.execute('SELECT * FROM sources WHERE id=?',(source_id,))] if source_id else [dict(r) for r in c.execute('SELECT * FROM sources WHERE enabled=1')]
         results=[]
         for source in sources:
-            new=duplicates=old=undated=future=0
+            new=duplicates=old=undated=future=excluded=0
             try:
-                items=collect(source)
+                items=collect(source);item_errors=[]
                 for item in items:
-                    pub=publication_status(item.get('published_at'))
-                    if pub=='old': old+=1;continue
-                    if pub=='unknown': undated+=1;continue
-                    if pub=='future': future+=1;continue
-                    item['source']=source['name']; result=add_job(item)
-                    if not result['duplicate'] and settings().get('auto_contacts'):
-                        from contact_search import search_contacts
-                        search_contacts(result['id'])
-                    if result['duplicate']: duplicates+=1
-                    else: new+=1
-                message=f'Найдено {len(items)}; добавлено {new}; дубли {duplicates}; старые {old}; без даты {undated}; будущие {future}. Только публикации с {month_cutoff().date()}.'
-                ok=True
+                    try:
+                        if not isinstance(item,dict) or not str(item.get('title','')).strip():raise ValueError('Источник передал карточку без названия')
+                        pub=publication_status(item.get('published_at'))
+                        if pub=='old': old+=1;continue
+                        if pub=='unknown': undated+=1;continue
+                        if pub=='future': future+=1;continue
+                        if classify(item.get('title',''),item.get('description',''))['filter_state']=='excluded':
+                            excluded+=1;continue
+                        item['source']=source['name']; result=add_job(item)
+                        if result['duplicate']: duplicates+=1
+                        else: new+=1
+                    except Exception as e:item_errors.append(str(e)[:200])
+                message=f'Найдено {len(items)}; добавлено {new}; дубли {duplicates}; старые {old}; без даты {undated}; будущие {future}; исключены фильтрами {excluded}. Только публикации с {month_cutoff().date()}.'
+                warnings=list(getattr(items,'warnings',[]))
+                if item_errors:warnings.append(f'Карточки с ошибками: {len(item_errors)}. '+item_errors[0])
+                if warnings:message+=' Неполный сбор: '+'; '.join(warnings)
+                ok=not warnings
             except Exception as e: message=str(e)[:500]; ok=False
             with db() as c: c.execute('UPDATE sources SET last_run=?,status=? WHERE id=?',(now(),message,source['id']))
-            results.append({'source':source['name'],'ok':ok,'new':new,'duplicates':duplicates,'old':old,'undated':undated,'message':message})
+            results.append({'source':source['name'],'ok':ok,'new':new,'duplicates':duplicates,'old':old,'undated':undated,'excluded':excluded,'future':future,'message':message})
+        # Enrichment failures must never abort collecting the remaining sources.
+        if settings().get('auto_contacts'):
+            from contact_search import search_contacts, store
+            with db() as c:
+                pending=[dict(r) for r in c.execute("SELECT * FROM jobs WHERE contact_status='not_searched'")]
+            for candidate in pending:
+                if decorate_job(candidate)['filter_state']=='excluded' or publication_status(candidate['published_at'])!='recent':continue
+                try:search_contacts(candidate['id'])
+                except Exception:
+                    store(candidate['id'],{'status':'error','candidates':[],'log':[{'step':'internal','ok':False,'message':'Поиск контакта не завершён. Повторите поиск в карточке.'}]})
         with db() as c:
             s=settings(); s['last_run']=now(); c.execute('UPDATE settings SET body=? WHERE id=1',(json.dumps(s),))
         return results

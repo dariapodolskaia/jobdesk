@@ -9,3 +9,4 @@ seed_profile.txt
 .idea/
 .env
 .env.*
+node_modules/
