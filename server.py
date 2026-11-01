@@ -120,7 +120,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith('/api/jobs/'):
                 result=core.update_job(int(path.rsplit('/',1)[1]),b)
             elif path=='/api/import-url': result=core.import_url(str(b.get('url','')))
-            elif path=='/api/parse-vacancy':result={'title':core.infer_job_title(str(b.get('description',''))[:100000])}
+            elif path=='/api/parse-vacancy':
+                description=str(b.get('description',''))[:100000];title=core.infer_job_title(description)
+                result={'title':title,'company':core.infer_company(str(b.get('title','')).strip() or title,description)}
             elif path=='/api/settings': result=core.set_settings(b)
             elif path=='/api/reclassify':
                 with db() as c: rows=[dict(r) for r in c.execute('SELECT * FROM jobs')]

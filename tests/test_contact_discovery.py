@@ -38,7 +38,7 @@ class ContactDiscoveryTests(unittest.TestCase):
         class Client:
             async def iter_messages(self,name,**kw):
                 captured.append(kw['search'])
-                yield SimpleNamespace(id=42,message='Plat4m. Tech ищет Middle QA Engineer. Контакт: HR',date=dt.datetime(2026,6,1,tzinfo=dt.timezone.utc),entities=[SimpleNamespace(url='https://t.me/hr_plat4mtech')],buttons=None)
+                yield SimpleNamespace(id=42,message='Plat4m. Tech ищет Middle QA Engineer. Контакт: HR',date=dt.datetime.now(dt.timezone.utc),entities=[SimpleNamespace(url='https://t.me/hr_plat4mtech')],buttons=None)
         with patch.object(integrations,'telegram_run',side_effect=lambda fn:asyncio.run(fn(Client()))):
             posts,errors=integrations.telegram_search_company('Plat4m.Tech',[{'name':'Jobs','url':'https://t.me/qa_jobs'}])
         self.assertEqual(captured,['Plat4m']);self.assertEqual(errors,[]);self.assertEqual(len(posts),1)
@@ -49,7 +49,7 @@ class ContactDiscoveryTests(unittest.TestCase):
         jid=core.add_job({'title':'Middle QA Engineer','company':'Plat4m.Tech','description':'Ручное тестирование','published_at':core.now()})['id']
         with core.db() as c:c.execute("INSERT INTO sources(name,kind,url) VALUES('Jobs','telegram','https://t.me/qa_jobs')")
         found=contact_search.extract_contacts('HR Manager Plat4m.tech @hr_plat4mtech','https://t.me/hr_plat4mtech','google')
-        posts=[{'text':'Plat4m.Tech Middle QA Engineer: @hr_plat4mtech','url':'https://t.me/qa_jobs/42'}]
+        posts=[{'text':'Plat4m.Tech Middle QA Engineer: @hr_plat4mtech','url':'https://t.me/qa_jobs/42','date':core.now()}]
         with patch.object(contact_search,'google_results',return_value=('query',['https://t.me/hr_plat4mtech'])),patch.object(contact_search,'page_contacts',return_value=found),patch.object(integrations,'telegram_search_company',return_value=(posts,[])) as search:
             result=contact_search.search_contacts(jid)
         search.assert_called_once();self.assertEqual(result['status'],'found');self.assertEqual(len(result['candidates']),1)

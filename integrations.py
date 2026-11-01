@@ -1,7 +1,7 @@
 """Telegram transport. Authorization is interactive CLI; sending is only called by confirmed API."""
 import asyncio, hashlib, json, os, re, secrets, threading
 from datetime import datetime, timezone, timedelta
-from core import DATA, db, job, now, update_job, month_cutoff, settings, collection_cutoff
+from core import DATA, db, job, now, update_job, month_cutoff, settings, collection_cutoff, months_cutoff
 TG_LOCK=threading.Lock()
 
 def config():
@@ -67,12 +67,15 @@ class TelegramPosts(list):
 
 def telegram_search_company(company,channels):
     from contact_search import company_search_term, company_matches
-    query=company_search_term(company)
+    query=company_search_term(company);reference=datetime.now().astimezone();cutoff=months_cutoff(3,reference)
     async def work(client):
         posts=[];errors=[];checked=attempted=0;deadline=asyncio.get_running_loop().time()+80
         async def search_channel(channel):
             name=channel_target(channel['url']);base=channel_url(channel['url'])
             async for msg in client.iter_messages(name,search=query,limit=10):
+                if not msg.date:continue
+                if msg.date<cutoff:break
+                if msg.date>reference+timedelta(minutes=5):continue
                 text=telegram_message_text(msg)
                 if text and company_matches(company,text):posts.append({'text':text,'url':f'{base}/{msg.id}','date':msg.date.isoformat() if msg.date else ''})
         for channel in channels:
@@ -89,6 +92,7 @@ def telegram_search_company(company,channels):
         posts.sort(key=lambda x:x['date'],reverse=True)
         unique={post['url']:post for post in posts}
         result=TelegramPosts(unique.values());result.channels_checked=checked;result.channels_attempted=attempted
+        result.cutoff=cutoff.isoformat()
         return result,errors
     return telegram_run(work)
 

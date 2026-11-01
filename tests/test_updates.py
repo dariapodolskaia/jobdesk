@@ -85,7 +85,7 @@ class UpdateTests(unittest.TestCase):
         with core.db() as c:c.execute("INSERT INTO sources(name,kind,url) VALUES('Канал','telegram','https://t.me/qa_jobs')")
         pages=['https://one.example/job','https://two.example/job','https://three.example/job'];order=[]
         def page(url):order.append(url);return []
-        def tg(company,channels):order.append('telegram');self.assertEqual(company,'Acme Labs');return ([{'text':'Acme Labs, пишите @recruiter','url':'https://t.me/qa_jobs/1'}],[])
+        def tg(company,channels):order.append('telegram');self.assertEqual(company,'Acme Labs');return ([{'text':'Acme Labs, пишите @recruiter','url':'https://t.me/qa_jobs/1','date':core.now()}],[])
         with patch.object(contact_search,'google_results',return_value=('query',pages)),patch.object(contact_search,'page_contacts',side_effect=page),patch.object(integrations,'telegram_search_company',side_effect=tg):r=contact_search.search_contacts(jid)
         self.assertEqual(order,pages+['telegram']);self.assertEqual(r['status'],'found');self.assertEqual(core.job(jid)['contact'],'')
         self.assertIn('@recruiter',core.job(jid)['contact_candidates'])

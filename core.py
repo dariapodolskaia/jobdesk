@@ -119,10 +119,12 @@ def canonical_url(url):
 def contacts(text):
     return list(dict.fromkeys(re.findall(r'[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}|https?://t\.me/[A-Za-z0-9_]+|(?<!\w)@[A-Za-z][A-Za-z0-9_]{4,}',text)))[:20]
 
-def month_cutoff(reference=None):
+def months_cutoff(months=1,reference=None):
     reference=reference or dt.datetime.now().astimezone()
-    year,month=(reference.year-1,12) if reference.month==1 else (reference.year,reference.month-1)
+    index=reference.year*12+reference.month-1-months;year,month=divmod(index,12);month+=1
     return reference.replace(year=year,month=month,day=min(reference.day,calendar.monthrange(year,month)[1]),hour=0,minute=0,second=0,microsecond=0)
+
+def month_cutoff(reference=None):return months_cutoff(1,reference)
 
 def validate_collection_period(period):
     if not isinstance(period,str) or period not in COLLECTION_PERIODS:raise ValueError('Выберите период: 1 день, 1, 2, 3 недели или месяц')
@@ -196,11 +198,22 @@ def infer_job_title(text):
             return re.sub(r'^(?:вакансия|должность|позиция)\s+','',line,flags=re.I).strip()
     return ''
 
+def infer_company(title,description=''):
+    # Bind a digest's selected role to its employer, not to another entry's company.
+    match=re.search(r'\s+(?:в(?:\s+компании)?|at)\s+[«"“]?([A-ZА-ЯЁ0-9][\w&.+ -]{1,100})[»"”]?\s*$',str(title).strip())
+    if match:
+        name=match[1].strip(' .—–-')
+        if not re.match(r'офис|команд|росси|москв|европ|грузи|польш|серби|кипр|германи|казахстан|беларус|рф\b|office\b|remote\b',name,re.I):return name
+    labels=re.findall(r'^\s*(?:компания|company|работодатель)\s*[:：—–-]\s*([^\n]{2,150})',description,re.I|re.M)
+    labels=list(dict.fromkeys(x.strip(' «»"“”') for x in labels))
+    if len(labels)==1:return labels[0]
+    return ''
+
 def add_job(v):
     description=str(v.get('description','')).strip()[:100000]
     title=(str(v.get('title','')).strip() or infer_job_title(description))[:300]
     if not title: raise ValueError('Укажите название вакансии')
-    company=str(v.get('company','')).strip()[:300]; url=canonical_url(str(v.get('url','')).strip())
+    company=(str(v.get('company','')).strip() or infer_company(title,description))[:300]; url=canonical_url(str(v.get('url','')).strip())
     fingerprint=hashlib.sha256((url or (title.casefold()+'|'+company.casefold()+'|'+description)).encode()).hexdigest()
     published=parse_date(v.get('published_at')); published_at=published.isoformat() if published else ''
     state=with_publication(classify(title,description),published_at)
@@ -234,6 +247,11 @@ def add_job(v):
         return {'id':cur.lastrowid,'duplicate':False}
 
 def decorate_job(j):
+    if j.get('contact_candidates'):
+        from contact_search import filter_contact_dates
+        previous=json.loads(j['contact_candidates']);filtered=filter_contact_dates(previous)
+        j={**j,'contact_candidates':json.dumps(filtered,ensure_ascii=False)}
+        if previous and not filtered and not j.get('contact'):j['contact_status']='not_searched'
     state=with_publication(classify(j['title'],j['description']),j.get('published_at',''))
     return {**j,'filter_state':state['filter_state'],'geo':state['geo'],'reasons':json.dumps(state['reasons'],ensure_ascii=False),'date_status':state['date_status']}
 

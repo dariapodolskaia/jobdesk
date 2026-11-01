@@ -108,8 +108,33 @@ def extract_contacts(text,source,method):
         seen.add(key);found.append({'value':value,'kind':kind,'source':source,'method':method,'context':text[max(0,match.start()-140):match.end()+140].strip(),'verified':False})
     return found[:30]
 
+def telegram_post_url(url):
+    p=urllib.parse.urlsplit(url)
+    return p.hostname in ('t.me','telegram.me') and bool(re.fullmatch(r'/(?:s/)?(?:[A-Za-z][\w]*|c/\d+)/\d+/?',p.path))
+
+def filter_contact_dates(candidates):
+    cutoff=core.months_cutoff(3);result=[]
+    for original in candidates:
+        item=dict(original)
+        def allowed(evidence):
+            if evidence.get('method')!='telegram' and not telegram_post_url(evidence.get('source','')):return True
+            return core.publication_status(evidence.get('published_at'),cutoff=cutoff)=='recent'
+        evidence=[dict(e) for e in item.get('evidence',[item]) if allowed(e)]
+        if not evidence:continue
+        if not allowed(item):
+            for key in ('source','method','context','published_at'):
+                if key in evidence[0]:item[key]=evidence[0][key]
+        if 'evidence' in item:item['evidence']=evidence
+        result.append(item)
+    return result
+
 def page_contacts(url):
     page=Page();page.feed(core.fetch(url))
+    post_date=''
+    if telegram_post_url(url):
+        post_date=page.times[0] if page.times else page.meta.get('article:published_time','')
+        if not post_date:raise ValueError('Дата Telegram-поста не подтверждена; контакт из него не используется')
+        if core.publication_status(post_date,cutoff=core.months_cutoff(3))!='recent':return []
     for script in page.scripts:
         try:
             postings=list(core.posting_objects(json.loads(script)))
@@ -117,11 +142,24 @@ def page_contacts(url):
         except (ValueError,TypeError):pass
     # Preserve mailto/tg hrefs while ignoring scripts, CSS and unrelated embedded strings.
     links='\n'.join(href.removeprefix('mailto:').split('?')[0] for href,label in page.links if href.startswith('mailto:') or re.search(r'(?:t\.me|telegram\.me)/',href))
-    return extract_contacts(page.plain()+'\n'+links,url,'google')
+    found=extract_contacts(page.plain()+'\n'+links,url,'google')
+    for contact in found:
+        if post_date:contact['published_at']=post_date
+    return found
 
 def search_contacts(jid):
     j=core.job(jid);log=[];errors=False
+    if not j['company'].strip():
+        inferred=core.infer_company(j['title'],j['description'])
+        if inferred:
+            with db() as c:
+                changed=c.execute("UPDATE jobs SET company=?,updated=? WHERE id=? AND trim(company)=''",(inferred,now(),jid)).rowcount
+                if changed:c.execute('INSERT INTO history(job_id,at,action) VALUES(?,?,?)',(jid,now(),'Компания определена из названия/текста вакансии: '+inferred))
+            j=core.job(jid);log.append({'step':'company','ok':True,'message':'Компания определена: '+j['company']})
     candidates=extract_contacts(j['description'],j['url'],'vacancy')
+    if telegram_post_url(j['url']):
+        for contact in candidates:contact['published_at']=j.get('published_at','')
+        candidates=filter_contact_dates(candidates)
     routes=json.loads(j.get('application_routes','[]'))
     if j['url'] and not any(r['url']==j['url'] for r in routes):routes.append({'kind':'board','url':j['url'],'verified':True,'label':'Исходная вакансия'})
     log.append({'step':'vacancy','ok':True,'found':len(candidates)})
@@ -137,6 +175,7 @@ def search_contacts(jid):
             query,urls=google_results(j['title'],j['company'],**({'purpose':purpose} if purpose else {}))
             log.append({'step':step,'ok':True,'message':query,'urls':list(urls)})
             for item in getattr(urls,'results',[]):
+                if telegram_post_url(item.get('link','')):continue
                 preview=item.get('title','')+' '+item.get('snippet','')+' '+item.get('link','')
                 for contact in extract_contacts(preview,item['link'],'search_preview'):
                     contact['evidence_level']='search_preview';candidates.append(contact)
@@ -155,14 +194,18 @@ def search_contacts(jid):
             log.append({'step':step,'ok':False,'message':message})
     # Company posts are an independent evidence source, including when web search succeeds.
     with db() as c: channels=[dict(r) for r in c.execute("SELECT * FROM sources WHERE kind='telegram'")]
+    source_usernames={'@'+c['url'].rstrip('/').rsplit('/',1)[-1].casefold() for c in channels if '/c/' not in c['url']}
+    candidates=[candidate for candidate in candidates if candidate['kind']!='telegram' or candidate['value'].casefold() not in source_usernames]
     if channels:
         try:
             from integrations import telegram_search_company
             posts,failures=telegram_search_company(j['company'],channels)
             for post in posts:
+                if core.publication_status(post.get('date'),cutoff=core.months_cutoff(3))!='recent':continue
                 for contact in extract_contacts(post['text'],post['url'],'telegram'):
+                    if contact['kind']=='telegram' and contact['value'].casefold() in source_usernames:continue
                     contact['published_at']=post.get('date','');candidates.append(contact)
-            log.append({'step':'telegram','ok':not failures,'posts_checked':len(posts),'channels_checked':getattr(posts,'channels_checked',len(channels)),'channels_total':len(channels),'channels_attempted':getattr(posts,'channels_attempted',len(channels)),'query':company_search_term(j['company']),'urls':[p['url'] for p in posts],'message':'Поиск компании по всем Telegram-источникам; проверены найденные посты, включая скрытые ссылки.','errors':failures})
+            log.append({'step':'telegram','ok':not failures,'posts_checked':len(posts),'channels_checked':getattr(posts,'channels_checked',len(channels)),'channels_total':len(channels),'channels_attempted':getattr(posts,'channels_attempted',len(channels)),'cutoff':getattr(posts,'cutoff',core.months_cutoff(3).isoformat()),'query':company_search_term(j['company']),'urls':[p['url'] for p in posts],'message':'Поиск компании по всем Telegram-источникам за последние 3 календарных месяца; проверены текст и скрытые ссылки.','errors':failures})
             if failures:errors=True
         except Exception as e:errors=True;log.append({'step':'telegram','ok':False,'message':str(e)[:500]})
     else:
@@ -185,7 +228,7 @@ def search_contacts(jid):
             if career['incomplete']:errors=True
         except Exception as e:errors=True;log.append({'step':'career_resolve','ok':False,'message':str(e)[:400]})
     if errors:
-        candidates.extend(json.loads(j.get('contact_candidates','[]')))
+        candidates.extend(filter_contact_dates(json.loads(j.get('contact_candidates','[]'))))
     unique=[];seen={}
     for item in candidates:
         key=(item['kind'],item['value'].casefold())
