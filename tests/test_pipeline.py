@@ -8,6 +8,7 @@ class PipelineTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
         self.patches=[patch.object(module,'DATA',Path(self.temp.name)) for module in (core,contact_search)]
+        self.patches.append(patch('career_discovery.resolve_career',return_value={'routes':[],'contacts':[],'log':[],'incomplete':False}))
         for p in self.patches:p.start()
         core.init();core.set_settings({'auto_contacts':False})
 
@@ -102,10 +103,10 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(r['status'],'found');self.assertEqual(r['candidates'][0]['value'],'@acme_hr')
         self.assertEqual(r['routes'][0]['url'],self.vacancy()['url'])
 
-    def test_career_candidate_precedes_board_without_auto_select(self):
+    def test_unverified_career_search_result_does_not_replace_board(self):
         jid=core.add_job(self.vacancy(url='https://hh.ru/vacancy/123'))['id']
         with patch.object(contact_search,'google_results',return_value=('query',['https://careers.acme.example/jobs/qa'])),patch.object(contact_search,'page_contacts',return_value=[]):r=contact_search.search_contacts(jid)
-        self.assertEqual(r['routes'][0]['kind'],'career');self.assertFalse(r['routes'][0]['verified']);self.assertEqual(core.job(jid)['contact'],'')
+        self.assertEqual(r['routes'][0]['kind'],'board');self.assertEqual(core.job(jid)['contact'],'')
 
     def test_first_heading_and_full_talent_body(self):
         raw='<script type="application/ld+json">'+json.dumps({'@type':'JobPosting','title':'QA | Acme','description':'short','datePosted':core.now(),'hiringOrganization':{'name':'Acme'}})+'</script><header><h1>Manual QA</h1><p>Удалённо</p></header><h3>Обязанности</h3><p>Тестирование API. '*20+'</p><div class="job-quality">Оценка</div><h1>TalentMove</h1>'

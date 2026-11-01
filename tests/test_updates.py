@@ -9,6 +9,7 @@ class UpdateTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.data=Path(self.temp.name)
         self.patches=[patch.object(core,'DATA',self.data),patch.object(contact_search,'DATA',self.data),patch.object(integrations,'DATA',self.data)]
+        self.patches.append(patch('career_discovery.resolve_career',return_value={'routes':[],'contacts':[],'log':[],'incomplete':False}))
         for p in self.patches:p.start()
         core.init()
     def tearDown(self):

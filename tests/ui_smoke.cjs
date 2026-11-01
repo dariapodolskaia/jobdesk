@@ -44,15 +44,16 @@ process.on('exit',()=>child.kill());
  q('#add').click();q('#description').value='Middle QA Engineer\nКомпания: Plat4m.Tech\nУдалённая работа';q('#description').dispatchEvent(new w.Event('input'));await wait(()=>q('#title').value==='Middle QA Engineer');
  q('#title').value='Моя должность';q('#title').dispatchEvent(new w.Event('input'));q('#description').value='Senior QA Engineer\nНовое описание';q('#description').dispatchEvent(new w.Event('input'));await new Promise(r=>setTimeout(r,350));assert.strictEqual(q('#title').value,'Моя должность');q('#close-dialog').click();
  q('[data-view="table"]').click();q('tbody tr').click();await wait(()=>q('#edit-job'));
- const realFetch=w.fetch;let contactPending=true;
+ const realFetch=w.fetch;let contactPending=true,applicationOnly=false;
  w.fetch=async(url,options)=>{
   if(url==='/api/contacts/search')return new Response(JSON.stringify({started:true}));
   const response=await realFetch(url,options);
   if(url==='/api/state'){const body=await response.json();body.contact_running=contactPending?[1]:[];contactPending=false;return new Response(JSON.stringify(body))}
-  if(url==='/api/jobs/1'){const body=await response.json();body.contact_status='found';body.contact_candidates=JSON.stringify([{value:'@hr_plat4mtech',kind:'telegram',source:'https://t.me/qa_jobs/42',method:'telegram',context:'HR компании'}]);return new Response(JSON.stringify(body))}
+  if(url==='/api/jobs/1'){const body=await response.json();body.contact_status=applicationOnly?'application_found':'found';body.contact_candidates=applicationOnly?'[]':JSON.stringify([{value:'@hr_plat4mtech',kind:'telegram',source:'https://t.me/qa_jobs/42',method:'telegram',context:'HR компании'}]);if(applicationOnly)body.application_routes=JSON.stringify([{kind:'career',url:'https://acme.example/jobs/qa#form',verified:true,application_type:'form',label:'Форма отклика на вакансию'}]);return new Response(JSON.stringify(body))}
   return response;
  };
- q('#letter').value='Несохранённый текст письма';q('#find-job-contact').click();await wait(()=>q('#contact-results').textContent.includes('@hr_plat4mtech'));assert.strictEqual(q('#letter').value,'Несохранённый текст письма');assert(!q('#find-job-contact').disabled);w.fetch=realFetch;
+ q('#letter').value='Несохранённый текст письма';q('#find-job-contact').click();await wait(()=>q('#contact-results').textContent.includes('@hr_plat4mtech'));assert.strictEqual(q('#letter').value,'Несохранённый текст письма');assert(!q('#find-job-contact').disabled);
+ applicationOnly=true;contactPending=true;q('#find-job-contact').click();await wait(()=>q('#contact-results').textContent.includes('есть способ отклика на сайте компании'));assert.strictEqual(q('#application-results a').href,'https://acme.example/jobs/qa#form');assert(q('#application-results').textContent.includes('проверено'));assert.strictEqual(q('#letter').value,'Несохранённый текст письма');w.fetch=realFetch;
  assert.deepStrictEqual(errors,[]);assert(!w.document.querySelector('script[src="alert(1)"]'));
  console.log('PASS: CRUD, sorting, periods, history, token privacy, title autofill without replacing edits, contact results refresh without losing unsaved letter. No JS errors.');dom.window.close();child.kill();
 })().catch(e=>{console.error(e);child.kill();process.exitCode=1});

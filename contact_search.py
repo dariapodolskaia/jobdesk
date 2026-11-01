@@ -123,15 +123,14 @@ def search_contacts(jid):
     j=core.job(jid);log=[];errors=False
     candidates=extract_contacts(j['description'],j['url'],'vacancy')
     routes=json.loads(j.get('application_routes','[]'))
-    if j['url'] and not any(r['url']==j['url'] for r in routes):routes.append({'kind':route_kind(j['url']) or 'board','url':j['url'],'verified':True,'label':'Исходная вакансия'})
+    if j['url'] and not any(r['url']==j['url'] for r in routes):routes.append({'kind':'board','url':j['url'],'verified':True,'label':'Исходная вакансия'})
     log.append({'step':'vacancy','ok':True,'found':len(candidates)})
     if not j['company'].strip():
         result={'status':'found' if candidates else 'partial','candidates':candidates,'routes':routes,'log':log+[{'step':'input','ok':False,'message':'Компания не извлечена: доступен исходный отклик, поиск прямого контакта требует компании.'}]}
         store(jid,result);return result
     visited=set();web_unavailable=False
-    for purpose in (None,'contact','career'):
-        if purpose=='career' and (candidates or any(r['kind']=='career' for r in routes)):continue
-        step={None:'google','contact':'company_hr','career':'career_search'}[purpose]
+    for purpose in (None,'contact'):
+        step='google' if purpose is None else 'company_hr'
         if web_unavailable:
             log.append({'step':step,'ok':False,'message':'Пропущен: веб-поисковик недоступен на предыдущем шаге; поиск в Telegram продолжается.'});continue
         try:
@@ -168,6 +167,23 @@ def search_contacts(jid):
         except Exception as e:errors=True;log.append({'step':'telegram','ok':False,'message':str(e)[:500]})
     else:
         errors=True;log.append({'step':'telegram','ok':False,'message':'Telegram-каналы ещё не добавлены в источники.'})
+    if not candidates and not j.get('contact'):
+        career_seeds=[r['url'] for r in routes if r.get('kind')=='career']
+        if not web_unavailable:
+            try:
+                career_query,career_urls=google_results(j['title'],j['company'],purpose='career')
+                career_seeds.extend(career_urls)
+                log.append({'step':'career_search','ok':True,'message':career_query,'urls':list(career_urls)})
+            except Exception as e:errors=True;log.append({'step':'career_search','ok':False,'message':str(e)[:400]})
+        else:log.append({'step':'career_search','ok':False,'message':'Веб-поиск недоступен; проверяем ссылки вакансии и уже найденные карьерные страницы.'})
+        try:
+            from career_discovery import resolve_career
+            career=resolve_career(j,career_seeds,filters=core.settings())
+            # Raw search links are not confirmed application routes.
+            routes=[r for r in routes if r.get('kind')!='career' or (r.get('verified') and r.get('application_type') in ('form','email'))]
+            routes.extend(career['routes']);candidates.extend(career['contacts']);log.extend(career['log'])
+            if career['incomplete']:errors=True
+        except Exception as e:errors=True;log.append({'step':'career_resolve','ok':False,'message':str(e)[:400]})
     if errors:
         candidates.extend(json.loads(j.get('contact_candidates','[]')))
     unique=[];seen={}
@@ -179,7 +195,8 @@ def search_contacts(jid):
         elif evidence not in seen[key]['evidence']:seen[key]['evidence'].append(evidence)
     # Contacts mentioned in several independent places, and explicit HR names, come first.
     unique.sort(key=lambda c:(-len(c['evidence']),not bool(re.search(r'hr|recruit|рекрут',c['value'],re.I))))
-    result={'status':'found' if unique else ('partial' if errors else 'not_found'),'candidates':unique,'routes':sorted({r['url']:r for r in routes}.values(),key=lambda r:r['kind']!='career'),'log':log}
+    application_found=any(r.get('verified') and r.get('application_type') in ('form','email') for r in routes)
+    result={'status':'found' if unique else ('application_found' if application_found else ('partial' if errors else 'not_found')),'candidates':unique,'routes':sorted({r['url']:r for r in routes}.values(),key=lambda r:0 if r['kind']=='career' and r.get('verified') else (1 if r['kind']=='board' else 2)),'log':log}
     store(jid,result);return result
 
 def store(jid,result):

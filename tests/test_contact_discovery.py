@@ -9,6 +9,7 @@ class ContactDiscoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
         self.patches=[patch.object(module,'DATA',Path(self.temp.name)) for module in (core,contact_search)]
+        self.patches.append(patch('career_discovery.resolve_career',return_value={'routes':[],'contacts':[],'log':[],'incomplete':False}))
         for p in self.patches:p.start()
         core.init()
 
@@ -71,6 +72,17 @@ class ContactDiscoveryTests(unittest.TestCase):
         result=core.add_job({'description':'Middle QA Engineer\nКомпания: Plat4m.Tech\nУдалённая работа'})
         self.assertEqual(core.job(result['id'])['title'],'Middle QA Engineer')
         self.assertEqual(core.infer_job_title('Описание вакансии\nТребования: знание QA и SQL'), '')
+
+    def test_career_resolution_runs_after_telegram_and_prioritizes_verified_form(self):
+        jid=core.add_job({'title':'Middle QA Engineer','company':'Acme Labs','url':'https://hh.ru/vacancy/123','description':'desc'})['id']
+        with core.db() as c:c.execute("INSERT INTO sources(name,kind,url) VALUES('Jobs','telegram','https://t.me/qa_jobs')")
+        order=[]
+        def telegram(*args):order.append('telegram');return [],[]
+        def career(job,seeds,**kw):
+            order.append('career')
+            return {'routes':[{'kind':'career','url':'https://acme.example/jobs/qa#form','verified':True,'application_type':'form','label':'Форма отклика'}],'contacts':[],'log':[],'incomplete':False}
+        with patch.object(contact_search,'google_results',return_value=('query',[])),patch.object(integrations,'telegram_search_company',side_effect=telegram),patch('career_discovery.resolve_career',side_effect=career):result=contact_search.search_contacts(jid)
+        self.assertEqual(order,['telegram','career']);self.assertEqual(result['status'],'application_found');self.assertEqual(result['routes'][0]['application_type'],'form');self.assertEqual(result['routes'][1]['kind'],'board')
 
 
 if __name__=='__main__':unittest.main()
