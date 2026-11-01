@@ -1,0 +1,28 @@
+process.chdir(require('path').resolve(__dirname,'..'));
+const {JSDOM}=require('jsdom');const fs=require('fs');const assert=require('assert');
+const child=require('child_process').spawn('python3',['server.py','--port','8876'],{env:{...process.env,JOBDESK_DATA:fs.mkdtempSync(require('os').tmpdir()+'/jobdesk-ui-')}});
+process.on('exit',()=>child.kill());
+(async()=>{
+ await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('error',reject)});
+ const errors=[]; const dom=new JSDOM(fs.readFileSync('static/index.html','utf8'),{url:'http://localhost:8876',runScripts:'outside-only'});const w=dom.window;
+ w.fetch=(url,opts)=>fetch(new URL(url,'http://127.0.0.1:8876'),opts);w.confirm=()=>true;
+ w.HTMLDialogElement.prototype.showModal=function(){this.open=true};w.HTMLDialogElement.prototype.close=function(){this.open=false};
+ w.addEventListener('error',e=>errors.push(e.error?.message||e.message));w.eval(fs.readFileSync('static/app.js','utf8'));
+ const wait=async f=>{for(let i=0;i<150;i++){if(f())return;await new Promise(r=>setTimeout(r,20))}throw Error('Timeout: '+w.document.querySelector('#content').textContent.slice(0,300)+' / '+w.document.querySelector('#toast').textContent)};
+ const q=s=>w.document.querySelector(s);const submit=s=>{const form=q(s),b=form.querySelector('button');form.dispatchEvent(new w.SubmitEvent('submit',{bubbles:true,cancelable:true,submitter:b}))};
+ await wait(()=>q('.board'));assert(q('.welcome'));
+ q('#add').click();q('#title').value='Manual QA';q('#company').value='Тестовая компания';q('#published_at').value=new Date().toISOString().slice(0,10);q('#description').value='Удалённая работа из любой страны. Тестирование API и веб-приложений.';submit('#job-form');
+ await wait(()=>q('#edit-job'));assert(q('#modal').textContent.includes('По фильтрам подходит'));
+ q('#letter').value='Здравствуйте! Прикладываю резюме.';q('#notes').value='<script>alert(1)</script>';q('#stage').value='interview';submit('#edit-job');
+ await wait(()=>q('#edit-job')&&q('#notes').value.includes('<script>'));await new Promise(r=>setTimeout(r,100));
+ q('#close-dialog').click();q('[data-view="table"]').click();assert(q('tbody').textContent.includes('Manual QA'));assert(q('tbody').textContent.includes('Интервью'));assert(q('[data-find-contact]'));assert(q('tbody').textContent.includes('Контакт ещё не искали'));
+ q('[data-view="sources"]').click();assert(w.document.querySelectorAll('.source-row').length===5);q('#new-source').click();q('#name').value='Новый канал';q('#url').value='@qa_jobs';submit('#source-form');
+ await wait(()=>!q('#dialog').open);assert(w.document.querySelectorAll('.source-row').length===6);
+ q('[data-view="calendar"]').click();q('#new-event').click();q('#title').value='Созвон';q('#start').value='2026-11-05T15:00';submit('#event-form');
+ await wait(()=>q('.event'));assert(q('.event').textContent.includes('Созвон'));
+ q('[data-view="settings"]').click();assert(q('#include').value.includes('manual qa'));assert(q('#diagnose-hh'));assert(q('#serper-key'));q('#hh_email').value='qa@example.com';q('#exclude').value+='\nruby';submit('#settings-form');await wait(()=>q('#toast').textContent==='Настройки сохранены');
+ q('[data-view="profile"]').click();q('#body').value='Проверенный опыт QA';submit('#profile-form');await wait(()=>q('#toast').textContent==='Профиль сохранён');
+ q('[data-view="board"]').click();assert(q('.card').textContent.includes('Manual QA'));
+ assert.deepStrictEqual(errors,[]);assert(!w.document.querySelector('script[src="alert(1)"]'));
+ console.log('PASS: empty board, manual create, safe notes, letter save, stage move, table, source addition, calendar event, filters, profile. No JS errors.');dom.window.close();child.kill();
+})().catch(e=>{console.error(e);child.kill();process.exitCode=1});
