@@ -79,12 +79,14 @@ class Handler(BaseHTTPRequestHandler):
             self.check_host(); path=urlsplit(self.path).path
             if path=='/api/state':
                 from integrations import connected
+                reference=dt.datetime.now().astimezone()
+                period_bounds={period:core.collection_cutoff(reference,period).isoformat() for period in core.COLLECTION_PERIODS}
                 with db() as c:
                     jobs=[core.decorate_job(dict(r)) for r in c.execute('SELECT * FROM jobs ORDER BY datetime(published_at) DESC,id DESC')]
                     sources=[dict(r) for r in c.execute('SELECT * FROM sources ORDER BY id')]
                     profile=dict(c.execute('SELECT * FROM profile WHERE id=1').fetchone())
                     events=[dict(r) for r in c.execute('SELECT e.*,j.company FROM events e LEFT JOIN jobs j ON e.job_id=j.id ORDER BY start')]
-                self.respond({'token':TOKEN,'jobs':jobs,'sources':sources,'profile':profile,'events':events,'settings':core.settings(),'stages':core.STAGES,'sync':RUN,'telegram':connected(),'contact_running':[k for k,v in CONTACT_RUN.items() if v],'cutoff':core.month_cutoff().date().isoformat()}); return
+                self.respond({'token':TOKEN,'jobs':jobs,'sources':sources,'profile':profile,'events':events,'settings':core.settings(),'stages':core.STAGES,'sync':RUN,'telegram':connected(),'contact_running':[k for k,v in CONTACT_RUN.items() if v],'cutoff':core.month_cutoff().date().isoformat(),'period_bounds':period_bounds,'period_reference':reference.isoformat()}); return
             if path.startswith('/api/jobs/'):
                 self.respond(core.job(int(path.rsplit('/',1)[1]))); return
             if path=='/api/cv.pdf':
